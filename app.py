@@ -5,23 +5,21 @@ import joblib
 import requests
 from datetime import datetime
 
-# --- 1. SET UP PAGE CONFIG ---
-st.set_page_config(page_title="Potato AI Advisor", page_icon="🥔")
-
-# --- 2. ACCESS API KEY FROM SECRETS ---
-# Ensure you have OWM_KEY = "your_key" in the Streamlit Cloud Secrets box
+# --- CONFIGURATION ---
+# Replace with your actual OpenWeatherMap API Key in Streamlit Secrets
 try:
-    api_key = st.secrets["OWM_KEY"]
-except Exception:
-    st.error("Missing API Key! Please add 'OWM_KEY' to your Streamlit Secrets.")
-    st.stop()
+    API_KEY = st.secrets["OWM_KEY"]
+except:
+    API_KEY = "YOUR_KEY_HERE" 
 
-# --- 3. LOAD AI MODELS (CACHED) ---
+CITY = "Dehradun" # You can change this to your location
+
+# --- LOAD ASSETS ---
 @st.cache_resource
 def load_assets():
     try:
-        # These filenames must match exactly what you upload to GitHub
-        model = tf.keras.models.load_model("potato_hybrid_model.h5")
+        # The 'compile=False' fix is included here
+        model = tf.keras.models.load_model("potato_hybrid_model.h5", compile=False)
         scaler = joblib.load("data_scaler.gz")
         return model, scaler
     except Exception as e:
@@ -30,63 +28,69 @@ def load_assets():
 
 model, scaler = load_assets()
 
-# --- 4. USER INTERFACE ---
+# --- APP UI ---
+st.set_page_config(page_title="Potato Irrigation AI", page_icon="🥔")
+
 st.title("🥔 Potato Smart Irrigation Advisor")
-st.info("AI-powered moisture prediction for precision farming.")
+st.markdown("### AI-powered moisture prediction for precision farming")
 
-# Sidebar for inputs
-with st.sidebar:
-    st.header("Field Settings")
-    lat = st.number_input("Latitude (e.g., 23.89)", value=23.8954, format="%.4f")
-    lon = st.number_input("Longitude (e.g., 73.12)", value=73.1234, format="%.4f")
-    sow_date = st.date_input("Sowing Date", value=datetime(2025, 11, 1))
-    st.divider()
-    st.write("Current Date:", datetime.now().strftime("%Y-%m-%d"))
+# Display Current Date
+current_time = datetime.now().strftime("%B %d, %Y | %H:%M")
+st.info(f"📅 **Current Date & Time:** {current_time}")
 
-# --- 5. PREDICTION LOGIC ---
-if st.button("Run AI Analysis", type="primary"):
-    if model is not None and scaler is not None:
-        with st.spinner("Fetching weather and running AI..."):
-            # Fetch Weather from OpenWeatherMap
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}&units=metric"
-            response = requests.get(url).json()
-            
-            if response.get("cod") == 200:
-                tmax = response['main']['temp_max']
-                tmin = response['main']['temp_min']
-                
-                # Calculate Days After Sowing (DAS)
-                das = (datetime.now().date() - sow_date).days
-                
-                # --- AI PREDICTION ---
-                # Your model expects 9 features:
-                # [T2M_MAX, T2M_MIN, ET0, SSM, NDVI, VH, VV, Daily_GDD, Mech_Baseline]
-                # We use local weather + baseline estimates for satellite features
-                input_data = np.array([[tmax, tmin, 4.8, 35.0, 0.5, -17.5, -11.5, 14.0, 42.0]])
-                
-                # Scale and Reshape for LSTM (1 sample, 1 timestep, 9 features)
-                scaled_input = scaler.transform(input_data)
-                prediction = model.predict(scaled_input.reshape(1, 1, 9), verbose=0)[0][0]
-                
-                # --- DISPLAY RESULTS ---
-                st.subheader(f"Status for Day {das} of Growth")
-                
-                kpi1, kpi2, kpi3 = st.columns(3)
-                kpi1.metric("Predicted Moisture", f"{round(float(prediction), 1)}%")
-                kpi2.metric("Max Temp", f"{tmax}°C")
-                kpi3.metric("Min Temp", f"{tmin}°C")
+# --- INPUT SECTION ---
+st.sidebar.header("Field Data")
+das = st.sidebar.slider("Days After Sowing (DAS)", 1, 120, 30)
 
-                # Decision Logic
-                if prediction < 45:
-                    st.error("🚨 **IRRIGATE IMMEDIATELY**: Soil moisture is below the safety threshold.")
-                elif 45 <= prediction < 60:
-                    st.warning("⚠️ **MONITOR CLOSELY**: Soil is drying out. Consider irrigation soon.")
-                else:
-                    st.success("✅ **SAFE**: Soil moisture is optimal for potato growth.")
-            else:
-                st.error("Weather API Error. Verify your API Key and Latitude/Longitude.")
+# Fetch Weather Data
+def get_weather(api_key, city):
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+    res = requests.get(url).json()
+    if res.get("main"):
+        return {
+            "temp": res["main"]["temp"],
+            "hum": res["main"]["humidity"],
+            "rain": res.get("rain", {}).get("1h", 0)
+        }
+    return None
+
+weather = get_weather(API_KEY, CITY)
+
+if weather:
+    st.sidebar.subheader(f"Weather in {CITY}")
+    temp = st.sidebar.number_input("Temperature (°C)", value=float(weather['temp']))
+    hum = st.sidebar.number_input("Humidity (%)", value=float(weather['hum']))
+    rain = st.sidebar.number_input("Rainfall (mm)", value=float(weather['rain']))
+else:
+    st.sidebar.warning("Weather API not connected. Please enter manually.")
+    temp = st.sidebar.number_input("Temperature (°C)", value=25.0)
+    hum = st.sidebar.number_input("Humidity (%)", value=60.0)
+    rain = st.sidebar.number_input("Rainfall (mm)", value=0.0)
+
+# --- PREDICTION LOGIC ---
+if st.button("Predict Soil Moisture"):
+    if model and scaler:
+        # Prepare input for prediction
+        # (Assuming your model expects: DAS, Temp, Hum, Rain)
+        input_data = np.array([[das, temp, hum, rain]])
+        input_scaled = scaler.transform(input_data)
+        
+        # Reshape for LSTM/GRNN (1 sample, 1 time step, 4 features)
+        input_reshaped = input_scaled.reshape((1, 1, 4))
+        
+        prediction = model.predict(input_reshaped)
+        moisture = prediction[0][0]
+        
+        st.metric("Predicted Soil Moisture", f"{moisture:.2f}%")
+        
+        if moisture < 30:
+            st.error("🚨 **Action Required:** Soil is too dry. Turn on irrigation!")
+        elif 30 <= moisture <= 60:
+            st.warning("⚠️ **Watchful:** Soil moisture is moderate.")
+        else:
+            st.success("✅ **Status:** Soil moisture is optimal. No irrigation needed.")
     else:
-        st.error("Model files not loaded. Ensure .h5 and .gz files are in the GitHub folder.")
+        st.error("Model files are missing. Please check your GitHub repository.")
 
-# --- 6. FOOTER ---
+st.divider()
 st.caption("AI Model: Potato Hybrid LSTM-GRNN | Data Source: OpenWeatherMap")

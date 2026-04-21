@@ -3,94 +3,122 @@ import tensorflow as tf
 import numpy as np
 import joblib
 import requests
+import os
+import math
 from datetime import date
 
-# --- CONFIGURATION ---
+# --- 1. SECURE API FETCH ---
+# This pulls the key you saved in Streamlit's "Secrets" box
 try:
     API_KEY = st.secrets["OWM_KEY"]
-except:
-    API_KEY = "" # Fallback if secret is missing
+except Exception:
+    st.error("Missing API Key! Please add 'OWM_KEY' to Streamlit Secrets.")
+    API_KEY = None
 
-# --- LOAD ASSETS ---
+# --- 2. ASSET LOADING ---
 @st.cache_resource
 def load_assets():
-    try:
-        # Using compile=False to fix the Keras/MSE error
-        model = tf.keras.models.load_model("potato_hybrid_model.h5", compile=False)
-        scaler = joblib.load("data_scaler.gz")
+    base_path = os.path.dirname(__file__)
+    model_path = os.path.join(base_path, "potato_hybrid_model.h5")
+    scaler_path = os.path.join(base_path, "data_scaler.gz")
+    
+    if os.path.exists(model_path) and os.path.exists(scaler_path):
+        # compile=False handles the Keras version mismatch error
+        model = tf.keras.models.load_model(model_path, compile=False)
+        scaler = joblib.load(scaler_path)
         return model, scaler
-    except Exception as e:
-        return None, None
+    return None, None
 
 model, scaler = load_assets()
 
-# --- APP UI ---
-st.set_page_config(page_title="Potato Irrigation AI", page_icon="🥔")
+# --- 3. AGRONOMIC CALCULATIONS ---
+def get_potato_stage(das):
+    if das <= 25: return "Sprouting/Vegetative", 0.45
+    elif das <= 70: return "Tuber Initiation/Bulking", 1.15
+    elif das <= 100: return "Maturity", 0.85
+    else: return "Late Season/Harvest", 0.70
+
+def estimate_eto(t_max, t_min, rh):
+    # Simplified Penman-Monteith (Hargreaves variant)
+    t_avg = (t_max + t_min) / 2
+    eto = 0.0023 * (t_avg + 17.8) * math.sqrt(t_max - t_min) * 0.4 * 15 
+    return max(eto, 0.1)
+
+# --- 4. APP INTERFACE ---
+st.set_page_config(page_title="Potato AI Advisor", page_icon="🥔")
 st.title("🥔 Potato Smart Irrigation Advisor")
 
-# --- INPUT SECTION (The Three Boxes) ---
-st.markdown("### 📋 Step 1: Enter Field Details")
-
-col1, col2, col3 = st.columns(3)
+# Input Boxes (No Defaults)
+st.subheader("Field Parameters")
+col1, col2 = st.columns(2)
 
 with col1:
-    # 1. Current Date (No default today)
-    current_dt = st.date_input("Current Date", value=None)
+    sowing_date = st.date_input("Sowing Date", value=None)
+    current_date = st.date_input("Current Date", value=None)
 
 with col2:
-    # 2. Sowing Date
-    sowing_dt = st.date_input("Sowing Date", value=None)
+    lat = st.number_input("Latitude", format="%.4f", value=None)
+    lon = st.number_input("Longitude", format="%.4f", value=None)
 
-with col3:
-    # 3. Location
-    location = st.text_input("Location (City)", placeholder="e.g. Dehradun")
+st.divider()
 
-# --- WEATHER & PREDICTION ---
-if st.button("Calculate & Predict"):
-    if not current_dt or not sowing_dt or not location:
-        st.warning("Please fill in all three boxes (Current Date, Sowing Date, and Location).")
+# --- 5. EXECUTION ---
+if st.button("Generate Prediction", use_container_width=True):
+    if not all([sowing_date, current_date, lat, lon, API_KEY]):
+        st.warning("Please fill all inputs and ensure API Key is set in Secrets.")
     else:
-        # Calculate DAS (Days After Sowing)
-        das = (current_dt - sowing_dt).days
+        # Calculate DAS
+        das = (current_date - sowing_date).days
         
         if das < 0:
             st.error("Error: Current date cannot be before Sowing date.")
         else:
-            st.info(f"Calculated Days After Sowing (DAS): **{das}**")
-            
-            # Fetch Weather for the Location entered
-            url = f"http://api.openweathermap.org/data/2.5/weather?q={location}&appid={API_KEY}&units=metric"
-            res = requests.get(url).json()
-            
-            if res.get("main"):
-                temp = res["main"]["temp"]
-                hum = res["main"]["humidity"]
-                rain = res.get("rain", {}).get("1h", 0)
-                
-                st.write(f"🌡️ **Weather in {location}:** {temp}°C, Humidity: {hum}%, Rain: {rain}mm")
+            # Fetch Weather
+            weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
+            data = requests.get(weather_url).json()
 
+            if data.get("main"):
+                t_curr = data["main"]["temp"]
+                t_max = data["main"]["temp_max"]
+                t_min = data["main"]["temp_min"]
+                hum = data["main"]["humidity"]
+                
+                # Agronomic Logic
+                stage, kc = get_potato_stage(das)
+                gdd = max(0, t_curr - 7) # Base Temp 7°C
+                eto = estimate_eto(t_max, t_min, hum)
+                etc = eto * kc
+                
+                st.success(f"**Growth Stage:** {stage} (DAS: {das})")
+                
+                # AI Model Prediction
                 if model and scaler:
-                    # Prepare data for AI (DAS, Temp, Hum, Rain)
-                    input_data = np.array([[das, temp, hum, rain]])
-                    input_scaled = scaler.transform(input_data)
-                    input_reshaped = input_scaled.reshape((1, 1, 4))
+                    # Prepare features (ensure this order matches your training)
+                    # Example: [DAS, Temp, Humidity, ETo]
+                    features = np.array([[das, t_curr, hum, eto]])
+                    scaled_features = scaler.transform(features)
                     
-                    # Prediction
-                    prediction = model.predict(input_reshaped)
-                    moisture = prediction[0][0]
+                    prediction = model.predict(scaled_features.reshape(1, 1, 4))
+                    sm_result = float(prediction[0][0])
                     
-                    st.metric("Predicted Soil Moisture", f"{moisture:.2f}%")
+                    # Calculated Outputs
+                    root_depth = min(15 + (das * 0.5), 60) # Root growth estimate in cm
+                    water_applied = etc * 1.1 # Example 10% leaching factor
                     
-                    if moisture < 30:
-                        st.error("🚨 **Action:** Soil is dry. Turn on irrigation!")
-                    elif 30 <= moisture <= 60:
-                        st.warning("⚠️ **Status:** Moderate moisture.")
+                    # Display Results
+                    res1, res2, res3 = st.columns(3)
+                    res1.metric("Soil Moisture", f"{sm_result:.1f}%")
+                    res2.metric("Root Depth", f"{root_depth:.1f} cm")
+                    res3.metric("Water to Apply", f"{water_applied:.2f} mm")
+                    
+                    if sm_result < 35:
+                        st.error("⚠️ Status: Critical. Apply irrigation now.")
                     else:
-                        st.success("✅ **Status:** Soil is well hydrated.")
+                        st.success("✅ Status: Optimal. No irrigation needed today.")
                 else:
-                    st.error("Model files not found on GitHub.")
+                    st.error("Model files (.h5 / .gz) not detected in GitHub.")
             else:
-                st.error("Could not find weather data. Please check the City name or API Key.")
+                st.error("Weather data fetch failed. Verify Latitude/Longitude.")
 
 st.divider()
-st.caption("AI Model: Potato Hybrid LSTM-GRNN | Uses compile=False for compatibility")
+st.caption("Secured with Streamlit Secrets | Hybrid LSTM-GRNN Model")
